@@ -242,7 +242,7 @@ def configure_mode(mode):
     os.makedirs(BUILD_PATH, exist_ok=True)
     current_dir = os.getcwd()
     os.chdir("apps/quicd/boringssl")
-    subprocess.run(["git", "checkout 9fc1c33e9c21439ce5f87855a6591a9324e569fd"])
+    subprocess.run(["git", "checkout", "9fc1c33e9c21439ce5f87855a6591a9324e569fd"])
     subprocess.run(["cmake", "."])
     subprocess.run(["make"])
     os.chdir("../lsquic")
