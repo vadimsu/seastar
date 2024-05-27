@@ -246,8 +246,15 @@ def configure_mode(mode):
     subprocess.run(["cmake", "."])
     subprocess.run(["make"])
     os.chdir("../lsquic")
+    subprocess.run(["git", "checkout", "v4.0.8"])
     subprocess.run(["git", "submodule", "update", "--init"])
-    os.chdir("../../")
+    os.chdir("..")
+    subprocess.run(["cat", "lsquic.patch"])
+    subprocess.run(["cat", "lsquic/bin/CMakeLists.txt"])
+    subprocess.run(["./apply_patch.sh"])
+    print("after")
+    subprocess.run(["cat", "lsquic/bin/CMakeLists.txt"])
+    os.chdir("..")
     subprocess.check_call(ARGS, shell=False, cwd=dir)
 
 for mode in MODES:
