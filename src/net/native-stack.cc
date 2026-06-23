@@ -50,6 +50,9 @@ module seastar;
 #include <seastar/net/udp.hh>
 #include <seastar/net/virtio.hh>
 #include <seastar/net/dpdk.hh>
+#ifdef SEASTAR_HAVE_DPDK
+#include <rte_ethdev.h>
+#endif
 #include <seastar/net/proxy.hh>
 #include <seastar/net/dhcp.hh>
 #include <seastar/net/config.hh>
@@ -207,6 +210,19 @@ public:
         internal::native_stack_net_stats::bytes_sent[scheduling_group_id] = 0;
         internal::native_stack_net_stats::bytes_received[scheduling_group_id] = 0;
     }
+
+    virtual tcp_counters get_tcp_counters() const noexcept override {
+        auto c = const_cast<native_network_stack*>(this)->_inet.get_tcp().get_counters();
+        return {c.syn_retransmits, c.data_retransmits, c.connections_established, c.connections_dropped};
+    }
+
+#ifdef SEASTAR_HAVE_DPDK
+    virtual dpdk_port_stats get_dpdk_port_stats() const noexcept override {
+        rte_eth_stats s = {};
+        rte_eth_stats_get(0, &s);
+        return {s.q_ipackets[this_shard_id()], s.q_opackets[this_shard_id()], s.q_ibytes[this_shard_id()], s.q_obytes[this_shard_id()], s.imissed, s.q_errors[this_shard_id()], s.rx_nombuf};
+    }
+#endif
 };
 
 thread_local promise<std::unique_ptr<network_stack>> native_network_stack::ready_promise;
@@ -331,6 +347,14 @@ void arp_learn(ethernet_address l2, ipv4_address l3)
     (void)smp::invoke_on_all([l2, l3] {
         auto & ns = static_cast<native_network_stack&>(engine().net());
         ns.arp_learn(l2, l3);
+    });
+}
+
+void arp_enable_passive_learning(bool enable)
+{
+    (void)smp::invoke_on_all([enable] {
+        auto& ns = static_cast<native_network_stack&>(engine().net());
+        ns._inet.enable_arp_passive_learning(enable);
     });
 }
 

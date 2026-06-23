@@ -23,6 +23,7 @@
 #pragma once
 
 #ifndef SEASTAR_MODULE
+#include <sstream>
 #include <unordered_map>
 #endif
 #include <seastar/net/net.hh>
@@ -144,6 +145,7 @@ private:
     l3addr _l3self = L3::broadcast_address();
     std::unordered_map<l3addr, l2addr> _table;
     std::unordered_map<l3addr, resolution> _in_progress;
+    bool _passive_learning = false;
 private:
     packet make_query_packet(l3addr paddr);
     virtual future<> received(packet p) override;
@@ -158,6 +160,7 @@ public:
     future<ethernet_address> lookup(const l3addr& addr);
     void learn(l2addr l2, l3addr l3);
     void run();
+    void enable_passive_learning(bool enable = true) { _passive_learning = enable; }
     void set_self_addr(l3addr addr) {
         _table.erase(_l3self);
         _table[addr] = l2self();
@@ -204,7 +207,8 @@ public:
 
 class arp_timeout_error : public arp_error {
 public:
-    arp_timeout_error() : arp_error("ARP timeout") {}
+    explicit arp_timeout_error(const std::string& addr)
+        : arp_error("ARP timeout resolving " + addr) {}
 };
 
 class arp_queue_full_error : public arp_error {
@@ -227,8 +231,11 @@ arp_for<L3>::lookup(const l3addr& paddr) {
         res._timeout_timer.set_callback([paddr, this, &res] {
             // FIXME: future is discarded
             (void)send_query(paddr);
+            std::ostringstream oss;
+            oss << paddr;
+            auto addr_str = oss.str();
             for (auto& w : res._waiters) {
-                w.set_exception(arp_timeout_error());
+                w.set_exception(arp_timeout_error(addr_str));
             }
             res._waiters.clear();
         });
@@ -273,6 +280,9 @@ arp_for<L3>::received(packet p) {
     }
     switch (h.oper) {
     case op_request:
+        if (_passive_learning) {
+            arp_learn(h.sender_hwaddr, h.sender_paddr);
+        }
         return handle_request(&h);
     case op_reply:
         arp_learn(h.sender_hwaddr, h.sender_paddr);

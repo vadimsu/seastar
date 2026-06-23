@@ -43,6 +43,13 @@
 
 namespace seastar {
 
+extern thread_local uint64_t sent_to_dpdk_device;
+extern thread_local uint64_t received_from_dpdk_device;
+extern thread_local uint64_t dpdk_device_rx_polled;
+extern thread_local uint64_t tx_polled;
+extern thread_local uint64_t same_core_packets;
+extern thread_local uint64_t x_core_packets;
+
 inline
 bool is_ip_unspecified(const ipv4_addr& addr) noexcept {
     return addr.is_ip_unspecified();
@@ -304,6 +311,11 @@ public:
     /// Gets O_REUSEADDR option
     /// \return whether the reuseaddr option is enabled or not
     bool get_reuseaddr() const;
+    /// Registers a port lifecycle callback.  Called with \c (port, true)
+    /// after the local port is chosen but before the first SYN, and with
+    /// \c (port, false) when the connected socket is destroyed.  Only
+    /// meaningful on the native (DPDK) stack; a no-op on the POSIX stack.
+    void set_port_lifecycle_hook(std::function<void(uint32_t, uint16_t, bool)> hook);
     /// Stops any in-flight connection attempt.
     ///
     /// Cancels the connection attempt if it's still in progress, and
@@ -365,6 +377,12 @@ public:
     /// Current and future \ref accept() calls will terminate immediately
     /// with an error.
     void abort_accept();
+
+    /// Registers a port lifecycle callback.  Called with \c (port, true)
+    /// immediately when the hook is installed on an already-bound socket,
+    /// and with \c (port, false) when the listener is closed.  Only
+    /// meaningful on the native (DPDK) stack; a no-op on the POSIX stack.
+    void set_port_lifecycle_hook(std::function<void(uint32_t, uint16_t, bool)> hook);
 
     /// Local bound address
     ///
@@ -485,6 +503,25 @@ public:
     virtual statistics stats(unsigned scheduling_group_id) = 0;
     // Clears the stats for this stack and scheduling group
     virtual void clear_stats(unsigned scheduling_group_id) = 0;
+
+    struct tcp_counters {
+        uint64_t syn_retransmits = 0;
+        uint64_t data_retransmits = 0;
+        uint64_t connections_established = 0;
+        uint64_t connections_dropped = 0;
+    };
+    virtual tcp_counters get_tcp_counters() const noexcept { return {}; }
+
+    struct dpdk_port_stats {
+        uint64_t q_ipackets  = 0; ///< successfully received packets
+        uint64_t q_opackets  = 0; ///< successfully transmitted packets
+        uint64_t q_ibytes    = 0; ///< successfully received bytes
+        uint64_t q_obytes    = 0; ///< successfully transmitted bytes
+        uint64_t imissed   = 0; ///< Rx drops: no descriptor / AF_XDP fill-ring full
+        uint64_t q_errors   = 0; ///< erroneous received packets
+        uint64_t rx_nombuf = 0; ///< Rx mbuf allocation failures
+    };
+    virtual dpdk_port_stats get_dpdk_port_stats() const noexcept { return {}; }
 
     /**
      * Returns available network interfaces. This represents a

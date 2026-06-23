@@ -71,6 +71,12 @@ module seastar;
 #include "core/vla.hh"
 #endif
 
+// Packet header parsing helpers from the xdp-tutorial library.
+// Handles VLAN tags (802.1Q/802.1AD up to VLAN_MAX_DEPTH levels) and
+// variable-length IPv4/TCP options via cursor-based bounds-checked parsing.
+// bpf_htons/bpf_ntohs resolve to __builtin_bswap16 / identity on x86 — same
+// semantics as htons/ntohs but using GCC intrinsics.
+
 #if RTE_VERSION <= RTE_VERSION_NUM(2,0,0,16)
 
 static
@@ -124,16 +130,43 @@ using namespace seastar::net;
 
 namespace seastar {
 
+thread_local uint64_t sent_to_dpdk_device = 0;
+thread_local uint64_t received_from_dpdk_device = 0;
+thread_local uint64_t dpdk_device_rx_polled = 0;
+thread_local uint64_t same_core_packets = 0;
+thread_local uint64_t x_core_packets = 0;
+
 namespace dpdk {
 
+// Cross-shard steering callback.  Receives TCP dst port in host byte order,
+// returns target shard id.  0xFF means "no steering — deliver locally".
+// Set once at startup via set_port_to_shard_fn() before any RX processing.
+static std::function<uint8_t(uint16_t)> g_port_to_shard_fn;
+
+void set_port_to_shard_fn(std::function<uint8_t(uint16_t)> fn) {
+    g_port_to_shard_fn = std::move(fn);
+}
+
+// Maximum number of cross-shard packets to accumulate per target shard before
+// flushing.  Reduces smp::submit_to overhead from O(n) to O(shards) per burst.
+// 0 means flush immediately (legacy per-packet behaviour).
+static uint16_t g_xcore_batch_max = 32;
+
+void set_xcore_batch_max(uint16_t n) {
+    g_xcore_batch_max = n;
+}
+
 /******************* Net device related constatns *****************************/
-static constexpr uint16_t default_ring_size      = 512;
+static constexpr uint16_t default_ring_size      = 2048;
 
 //
-// We need 2 times the ring size of buffers because of the way PMDs
-// refill the ring.
+// For standard PMDs: 2× ring_size is enough because the PMD refills in
+// ring_size-sized batches.  For the AF_XDP PMD the fill ring must be
+// pre-populated with ETH_AF_XDP_DFLT_NUM_DESCS (2048) frames at startup,
+// and the XSK RX ring (ring_size) plus in-flight processing need additional
+// headroom.  8× gives: 2048 fill-ring + 512 XSK-RX + 1536 in-flight = 4096.
 //
-static constexpr uint16_t mbufs_per_queue_rx     = 2 * default_ring_size;
+static constexpr uint16_t mbufs_per_queue_rx     = 8 * default_ring_size;
 static constexpr uint16_t rx_gc_thresh           = 64;
 
 //
@@ -1297,7 +1330,7 @@ private:
         uint16_t sent = rte_eth_tx_burst(_dev->port_idx(), _qid,
                                          _tx_burst.data() + _tx_burst_idx,
                                          _tx_burst.size() - _tx_burst_idx);
-
+	sent_to_dpdk_device += sent;
         uint64_t nr_frags = 0, bytes = 0;
 
         for (int i = 0; i < sent; i++) {
@@ -1434,6 +1467,23 @@ private:
     std::vector<rte_mbuf*> _tx_burst;
     uint16_t _tx_burst_idx = 0;
     static constexpr phys_addr_t page_mask = ~(memory::page_size - 1);
+    // Per-target-shard batch buffers for cross-core packet forwarding.
+    // Indexed by shard id (0–255).  Flushed at the end of process_packets()
+    // via a single smp::submit_to per non-empty target, reducing IPC overhead.
+    std::array<std::vector<packet>, 256> _xcore_batch;
+
+    void flush_xcore_batches() {
+        for (uint16_t t = 0; t < 256; ++t) {
+            if (_xcore_batch[t].empty())
+                continue;
+            (void)smp::submit_to(t,
+                [dev = _dev, batch = std::move(_xcore_batch[t])]() mutable {
+                    for (auto& p : batch)
+                        dev->l2receive(std::move(p));
+                });
+            _xcore_batch[t].clear();
+        }
+    }
 };
 
 int dpdk_device::init_port_start()
@@ -1554,6 +1604,15 @@ int dpdk_device::init_port_start()
                    _port_idx, _dev_info.reta_size);
         } else {
             _rss_table_bits = std::lround(std::log2(_dev_info.max_rx_queues));
+	    // No hardware RETA: build a software indirection table so that
+	    // hash2qid() never asserts on an empty _redir_table.
+	    // Size must be a power-of-2 for the bitmask in hash2qid().
+	    unsigned bits = 0;
+	    while ((1u << bits) < _num_queues) bits++;
+	    _redir_table.resize(1u << bits);
+	    for (size_t i = 0; i < _redir_table.size(); i++) {
+		    _redir_table[i] = static_cast<uint8_t>(i % _num_queues);
+	    }
         }
     } else {
         _redir_table.push_back(0);
@@ -1720,6 +1779,7 @@ void dpdk_device::init_port_fini()
             _xstats.get_value(dpdk_xstats::xstat_id::rx_undersize_errors) +
             _xstats.get_value(dpdk_xstats::xstat_id::rx_oversize_errors);
         _stats.rx.bad.total       = rte_stats.ierrors;
+        _stats.rx.bad.total      += rte_stats.imissed; /* AF_XDP fill-ring drops */
 
         _stats.tx.good.pause_xon  =
             _xstats.get_value(dpdk_xstats::xstat_id::tx_xon_packets);
@@ -2137,6 +2197,36 @@ bool dpdk_qp<HugetlbfsMemBackend>::rx_gc()
 }
 
 
+// Parse the TCP destination port (host byte order) from the first fragment of
+// a packet starting with an Ethernet header.  Returns nullopt for non-IPv4,
+// non-TCP, or malformed packets.  Only examines the first fragment; DPDK mbuf
+// chains are always contiguous for the headers we care about.
+// Uses parsing_helpers.h so VLAN tags (802.1Q/802.1AD) and variable-length
+// IPv4 options are handled correctly.
+static std::optional<uint16_t> tcp_dst_port_from_packet(const net::packet& p) noexcept {
+	if (p.nr_frags() == 0) return std::nullopt;
+	auto frags = p.fragments();
+	void* data     = const_cast<char*>(frags.begin()->base);
+
+	// 1. Get Ethernet header
+	struct rte_ether_hdr *eth_hdr = (struct rte_ether_hdr *)data;
+	// 2. Check for IPv4
+	if (rte_be_to_cpu_16(eth_hdr->ether_type) == RTE_ETHER_TYPE_IPV4) {
+		struct rte_ipv4_hdr *ipv4_hdr = (struct rte_ipv4_hdr *)(eth_hdr + 1);
+
+		// 3. Check for TCP
+		if (ipv4_hdr->next_proto_id == IPPROTO_TCP) {
+			// Calculate IPv4 header length dynamically to skip options
+			uint8_t ip_hdr_len = (ipv4_hdr->version_ihl & 0x0F) * 4;
+			struct rte_tcp_hdr *tcp_hdr = (struct rte_tcp_hdr *)((char *)ipv4_hdr + ip_hdr_len);
+
+			// 4. Return Port (Convert from Network Byte Order to Host Byte Order)
+			return rte_be_to_cpu_16(tcp_hdr->dst_port);
+		}
+	}
+	return std::nullopt;
+}
+
 template <bool HugetlbfsMemBackend>
 void dpdk_qp<HugetlbfsMemBackend>::process_packets(
     struct rte_mbuf **bufs, uint16_t count)
@@ -2180,9 +2270,36 @@ void dpdk_qp<HugetlbfsMemBackend>::process_packets(
         if (m->ol_flags & RTE_MBUF_F_RX_RSS_HASH) {
             (*p).set_rss_hash(m->hash.rss);
         }
-
-        _dev->l2receive(std::move(*p));
+        bool forwarded = false;
+        if (g_port_to_shard_fn) {
+            if (auto dst = tcp_dst_port_from_packet(*p)) {
+                uint8_t target = g_port_to_shard_fn(*dst);
+                if (target != 0xFF && target != _qid) {
+                    // Wrap the deleter so it fires back on this shard when the
+                    // packet is eventually freed on the target shard.
+                    auto fwd = p->free_on_cpu(_qid);
+                    if (g_xcore_batch_max == 0) {
+                        (void)smp::submit_to(target,
+                            [dev = _dev, fwd = std::move(fwd)]() mutable {
+                                dev->l2receive(std::move(fwd));
+                            });
+                    } else {
+                        _xcore_batch[target].push_back(std::move(fwd));
+                        if (_xcore_batch[target].size() >= g_xcore_batch_max)
+                            flush_xcore_batches();
+                    }
+		    x_core_packets++;
+                    forwarded = true;
+                }
+            }
+        }
+        if (!forwarded) {
+            _dev->l2receive(std::move(*p));
+	    same_core_packets++;
+        }
     }
+
+    flush_xcore_batches();
 
     _stats.rx.good.update_pkts_bunch(count);
     _stats.rx.good.update_frags_stats(nr_frags, bytes);
@@ -2197,13 +2314,14 @@ template <bool HugetlbfsMemBackend>
 bool dpdk_qp<HugetlbfsMemBackend>::poll_rx_once()
 {
     struct rte_mbuf *buf[packet_read_size];
-
+    dpdk_device_rx_polled++;
     /* read a port */
     uint16_t rx_count = rte_eth_rx_burst(_dev->port_idx(), _qid,
                                          buf, packet_read_size);
 
     /* Now process the NIC packets read */
     if (likely(rx_count > 0)) {
+	received_from_dpdk_device +=rx_count;
         process_packets(buf, rx_count);
     }
 
@@ -2321,10 +2439,15 @@ dpdk_options::dpdk_options(program_options::option_group* parent_group)
     , hw_fc(*this, "hw-fc",
                 "on",
                 "Enable HW Flow Control (on / off)")
+    , dpdk_extra_eal_args(*this, "dpdk-extra-eal-args",
+                "",
+                "Extra EAL arguments passed verbatim to rte_eal_init() (space-separated), "
+                "e.g. \"--no-pci --vdev=net_af_xdp0,iface=eth0,start_queue=0,queue_count=2\"")
 #else
     : program_options::option_group(parent_group, "DPDK net options", program_options::unused{})
     , dpdk_port_index(*this, "dpdk-port-index", program_options::unused{})
     , hw_fc(*this, "hw-fc", program_options::unused{})
+    , dpdk_extra_eal_args(*this, "dpdk-extra-eal-args", program_options::unused{})
 #endif
 #if 0
     opts.add_options()

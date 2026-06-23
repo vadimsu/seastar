@@ -591,10 +591,12 @@ private:
         void do_established() {
             _state = ESTABLISHED;
             update_rto(_snd.syn_tx_time);
+            _tcp._connections_established++;
             _connect_done.set_value();
         }
         void do_reset() {
             _state = CLOSED;
+            _tcp._connections_dropped++;
             cleanup();
             if (_rcv._data_received_promise) {
                 _rcv._data_received_promise->set_exception(tcp_reset_error());
@@ -665,6 +667,21 @@ private:
     circular_buffer<ipv4_traits::l4packet> _packetq;
     semaphore _queue_space = {212992};
     metrics::metric_groups _metrics;
+    uint64_t _syn_retransmits = 0;
+    uint64_t _data_retransmits = 0;
+    uint64_t _connections_established = 0;
+    uint64_t _connections_dropped = 0;
+public:
+    struct counters {
+        uint64_t syn_retransmits;
+        uint64_t data_retransmits;
+        uint64_t connections_established;
+        uint64_t connections_dropped;
+    };
+    counters get_counters() const noexcept {
+        return {_syn_retransmits, _data_retransmits, _connections_established, _connections_dropped};
+    }
+private:
 public:
     const inet_type& inet() const {
         return _inet;
@@ -761,7 +778,7 @@ public:
     void received(packet p, ipaddr from, ipaddr to);
     bool forward(forward_hash& out_hash_data, packet& p, size_t off);
     listener listen(uint16_t port, size_t queue_length = 100);
-    connection connect(socket_address sa);
+    connection connect(socket_address sa, std::function<void(uint32_t, uint16_t)> port_acquired_hook = {});
     const net::hw_features& hw_features() const { return _inet._inet.hw_features(); }
     future<> poll_tcb(ipaddr to, lw_shared_ptr<tcb> tcb);
     void add_connected_tcb(lw_shared_ptr<tcb> tcbp, uint16_t local_port) {
@@ -786,7 +803,15 @@ tcp<InetTraits>::tcp(inet_type& inet)
     _metrics.add_group("tcp", {
         sm::make_counter("linearizations", [] { return tcp_packet_merger::linearizations(); },
                         sm::description("Counts a number of times a buffer linearization was invoked during the buffers merge process. "
-                                        "Divide it by a total TCP receive packet rate to get an everage number of lineraizations per TCP packet."))
+                                        "Divide it by a total TCP receive packet rate to get an everage number of lineraizations per TCP packet.")),
+        sm::make_counter("syn_retransmits", _syn_retransmits,
+                        sm::description("Number of SYN retransmissions (indicates missed SYN-ACK, likely XDP redirect failure or fill-ring drop).")),
+        sm::make_counter("data_retransmits", _data_retransmits,
+                        sm::description("Number of data segment retransmissions.")),
+        sm::make_counter("connections_established", _connections_established,
+                        sm::description("Number of TCP connections successfully established.")),
+        sm::make_counter("connections_dropped", _connections_dropped,
+                        sm::description("Number of TCP connections dropped (RST received or timeout)."))
     });
 
     _inet.register_packet_provider([this, tcb_polled = 0u] () mutable {
@@ -827,7 +852,7 @@ auto tcp<InetTraits>::listen(uint16_t port, size_t queue_length) -> listener {
 }
 
 template <typename InetTraits>
-auto tcp<InetTraits>::connect(socket_address sa) -> connection {
+auto tcp<InetTraits>::connect(socket_address sa, std::function<void(uint32_t, uint16_t)> port_acquired_hook) -> connection {
     connid id;
     auto src_ip = _inet._inet.host_address();
     auto dst_ip = ipv4_address(sa);
@@ -844,6 +869,9 @@ auto tcp<InetTraits>::connect(socket_address sa) -> connection {
 
     auto tcbp = make_lw_shared<tcb>(*this, id);
     _tcbs.insert({id, tcbp});
+    if (port_acquired_hook) {
+        port_acquired_hook(src_ip.ip, id.local_port);
+    }
     tcbp->connect();
     return connection(tcbp);
 }
@@ -1966,6 +1994,7 @@ void tcp<InetTraits>::tcb::retransmit() {
     // Retransmit SYN
     if (syn_needs_on()) {
         if (_snd.syn_retransmit++ < _max_nr_retransmit) {
+            _tcp._syn_retransmits++;
             output_update_rto();
         } else {
             _connect_done.set_exception(tcp_connect_error());
@@ -1988,6 +2017,14 @@ void tcp<InetTraits>::tcb::retransmit() {
     if (_snd.data.empty()) {
         return;
     }
+
+    // When the peer's receive window is zero the persist timer owns probing;
+    // a data retransmit here would violate the SEASTAR_ASSERT in output_one().
+    if (_snd.window == 0) {
+        return;
+    }
+
+    _tcp._data_retransmits++;
 
     // If there are unacked data, retransmit the earliest segment
     auto& unacked_seg = _snd.data.front();
@@ -2019,7 +2056,7 @@ void tcp<InetTraits>::tcb::retransmit() {
 
 template <typename InetTraits>
 void tcp<InetTraits>::tcb::fast_retransmit() {
-    if (!_snd.data.empty()) {
+    if (!_snd.data.empty() && _snd.window > 0) {
         auto& unacked_seg = _snd.data.front();
         unacked_seg.nr_transmits++;
         retransmit_one();

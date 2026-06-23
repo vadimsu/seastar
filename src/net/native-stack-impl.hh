@@ -57,11 +57,14 @@ class native_network_stack;
 template <typename Protocol>
 class native_server_socket_impl : public server_socket_impl {
     typename Protocol::listener _listener;
+    std::function<void(uint32_t, uint16_t, bool)> _port_lifecycle_hook;
 public:
     native_server_socket_impl(Protocol& proto, uint16_t port, listen_options opt);
+    ~native_server_socket_impl();
     virtual future<accept_result> accept() override;
     virtual void abort_accept() override;
     virtual socket_address local_address() const override;
+    virtual void set_port_lifecycle_hook(std::function<void(uint32_t, uint16_t, bool)> hook) override;
 };
 
 template <typename Protocol>
@@ -70,16 +73,37 @@ native_server_socket_impl<Protocol>::native_server_socket_impl(Protocol& proto, 
 }
 
 template <typename Protocol>
+native_server_socket_impl<Protocol>::~native_server_socket_impl() {
+    if (_port_lifecycle_hook) {
+        auto la = local_address();
+        _port_lifecycle_hook(ntohl(la.u.in.sin_addr.s_addr), _listener.port(), false);
+    }
+}
+
+template <typename Protocol>
+void native_server_socket_impl<Protocol>::set_port_lifecycle_hook(std::function<void(uint32_t, uint16_t, bool)> hook) {
+    _port_lifecycle_hook = hook;
+    if (_port_lifecycle_hook) {
+        auto la = local_address();
+        _port_lifecycle_hook(ntohl(la.u.in.sin_addr.s_addr), _listener.port(), true);
+    }
+}
+
+template <typename Protocol>
 future<accept_result>
 native_server_socket_impl<Protocol>::accept() {
-    return _listener.accept().then([] (typename Protocol::connection conn) {
+    return _listener.accept().then([this] (typename Protocol::connection conn) {
         // Save "conn" contents before call below function
         // "conn" is moved in 1st argument, and used in 2nd argument
         // It causes trouble on Arm which passes arguments from left to right
         auto ip = conn.foreign_ip().ip;
         auto port = conn.foreign_port();
+	if (_port_lifecycle_hook) {
+        	_port_lifecycle_hook(ip, port, true);
+	}
+	auto si = std::make_unique<native_connected_socket_impl<Protocol>>(make_lw_shared(std::move(conn)), _port_lifecycle_hook, ip, port);
         return make_ready_future<accept_result>(accept_result{
-                connected_socket(std::make_unique<native_connected_socket_impl<Protocol>>(make_lw_shared(std::move(conn)))),
+                connected_socket(move(si)),
                 make_ipv4_address(ip, port)});
     });
 }
@@ -87,6 +111,11 @@ native_server_socket_impl<Protocol>::accept() {
 template <typename Protocol>
 void
 native_server_socket_impl<Protocol>::abort_accept() {
+    if (_port_lifecycle_hook) {
+        auto la = local_address();
+        _port_lifecycle_hook(ntohl(la.u.in.sin_addr.s_addr), _listener.port(), false);
+        _port_lifecycle_hook = {};
+    }
     _listener.abort_accept();
 }
 
@@ -99,11 +128,22 @@ socket_address native_server_socket_impl<Protocol>::local_address() const {
 template <typename Protocol>
 class native_connected_socket_impl : public connected_socket_impl {
     lw_shared_ptr<typename Protocol::connection> _conn;
+    std::function<void(uint32_t, uint16_t, bool)> _port_lifecycle_hook;
+    uint32_t _hook_ip = 0;
+    uint16_t _hook_port = 0;
     class native_data_source_impl;
     class native_data_sink_impl;
 public:
-    explicit native_connected_socket_impl(lw_shared_ptr<typename Protocol::connection> conn)
-        : _conn(std::move(conn)) {}
+    explicit native_connected_socket_impl(lw_shared_ptr<typename Protocol::connection> conn,
+                                          std::function<void(uint32_t, uint16_t, bool)> hook = {},
+                                          uint32_t hook_ip = 0, uint16_t hook_port = 0)
+        : _conn(std::move(conn)), _port_lifecycle_hook(hook),
+          _hook_ip(hook_ip), _hook_port(hook_port) {}
+    ~native_connected_socket_impl() {
+        if (_port_lifecycle_hook && _hook_port != 0) {
+            _port_lifecycle_hook(_hook_ip, _hook_port, false);
+        }
+    }
     using connected_socket_impl::source;
     virtual data_source source() override;
     virtual data_sink sink() override;
@@ -126,9 +166,14 @@ template <typename Protocol>
 class native_socket_impl final : public socket_impl {
     Protocol& _proto;
     lw_shared_ptr<typename Protocol::connection> _conn;
+    std::function<void(uint32_t, uint16_t, bool)> _port_lifecycle_hook;
 public:
     explicit native_socket_impl(Protocol& proto)
         : _proto(proto), _conn(nullptr) { }
+
+    virtual void set_port_lifecycle_hook(std::function<void(uint32_t, uint16_t, bool)> hook) override {
+        _port_lifecycle_hook = hook;
+    }
 
     virtual future<connected_socket> connect(socket_address sa, socket_address local, transport proto = transport::TCP) override {
         //TODO: implement SCTP
@@ -137,9 +182,28 @@ public:
         // FIXME: local is ignored since native stack does not support multiple IPs yet
         SEASTAR_ASSERT(sa.as_posix_sockaddr().sa_family == AF_INET);
 
-        _conn = make_lw_shared<typename Protocol::connection>(_proto.connect(sa));
-        return _conn->connected().then([conn = _conn]() mutable {
-            auto csi = std::make_unique<native_connected_socket_impl<Protocol>>(std::move(conn));
+        auto hook = std::move(_port_lifecycle_hook);
+        // Capture the (ip, port) registered via port_acquired_hook so the destructor
+        // unregisters exactly what was registered (local ip + ephemeral port).
+        auto registered = std::make_shared<std::pair<uint32_t, uint16_t>>(0, 0);
+        _conn = make_lw_shared<typename Protocol::connection>(
+            _proto.connect(sa, hook ? std::function<void(uint32_t, uint16_t)>(
+                                          [h = hook, registered](uint32_t ip, uint16_t p) {
+                                              *registered = {ip, p};
+                                              h(ip, p, true);
+                                          })
+                                    : std::function<void(uint32_t, uint16_t)>{}));
+        return _conn->connected().then_wrapped([conn = _conn, hook = std::move(hook), registered](future<> fut) mutable {
+            if (fut.failed()) {
+                // Connection failed after the port-acquired hook already fired (XDP rule added).
+                // native_connected_socket_impl will never be created, so we must remove the rule here.
+                if (hook && registered->second != 0) {
+                    hook(registered->first, registered->second, false);
+                }
+                return make_exception_future<connected_socket>(fut.get_exception());
+            }
+            auto csi = std::make_unique<native_connected_socket_impl<Protocol>>(
+                std::move(conn), hook, registered->first, registered->second);
             return make_ready_future<connected_socket>(connected_socket(std::move(csi)));
         });
     }

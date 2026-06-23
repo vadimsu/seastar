@@ -22,6 +22,7 @@
 #pragma once
 
 #include <memory>
+#include <functional>
 #include <seastar/net/config.hh>
 #include <seastar/net/net.hh>
 #include <seastar/core/sstring.hh>
@@ -41,6 +42,11 @@ struct dpdk_options : public program_options::option_group {
     ///
     /// Default: \p on.
     program_options::value<std::string> hw_fc;
+    /// \brief Extra EAL arguments passed verbatim to rte_eal_init().
+    ///
+    /// Space-separated list of EAL flags appended after Seastar's own
+    /// generated arguments, e.g. "--no-pci --vdev=net_af_xdp0,iface=eth0".
+    program_options::value<std::string> dpdk_extra_eal_args;
 
     /// \cond internal
     dpdk_options(program_options::option_group* parent_group);
@@ -67,6 +73,22 @@ namespace dpdk {
  * @return Number of bytes needed for mempool objects of each QP.
  */
 uint32_t qp_mempool_obj_size(bool hugetlbfs_membackend);
+
+/**
+ * Install a per-port cross-shard steering callback.  The function receives a
+ * TCP destination port (host byte order) and returns the target shard id, or
+ * 0xFF (XDP_NO_SHARD) when no steering is needed.  Must be called before the
+ * first packet is received.
+ */
+void set_port_to_shard_fn(std::function<uint8_t(uint16_t)> fn);
+
+/**
+ * Set the maximum number of cross-shard packets to batch per target shard
+ * before flushing to smp::submit_to.  Reduces per-packet IPC overhead.
+ * 0 = flush immediately (legacy behaviour).  Default = 32.
+ * Must be called before RX processing starts or from shard 0.
+ */
+void set_xcore_batch_max(uint16_t n);
 }
 
 /// \endcond

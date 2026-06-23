@@ -57,6 +57,7 @@ set(rte_libs
   mempool
   mempool_ring
   net
+  net_af_xdp
   net_bnxt
   net_cxgbe
   net_e1000
@@ -94,6 +95,7 @@ set (CMAKE_FIND_LIBRARY_SUFFIXES
 foreach (lib ${rte_libs})
   string(TOUPPER ${lib} upper_lib)
   set(library_name "dpdk_${upper_lib}_LIBRARY")
+  unset(${library_name} CACHE)
   find_library (${library_name}
     NAME rte_${lib}
     HINTS
@@ -146,6 +148,24 @@ endforeach ()
 # exists.
 pkg_check_modules (libarchive_PC QUIET libarchive)
 list(APPEND dpdk_dependencies ${libarchive_PC_LIBRARIES})
+
+# The AF_XDP PMD links against libxdp and libbpf (and their transitive deps)
+# which are not DPDK libraries and are not tracked in rte_libs.
+#foreach (_xdp_dep xdp bpf)
+#  find_library (_xdp_dep_${_xdp_dep}_LIBRARY
+#    NAMES lib${_xdp_dep}.a
+#    HINTS
+#      ${dpdk_PC_STATIC_LIBRARY_DIRS}
+#      ${CMAKE_CURRENT_LIST_DIR}/../../xdp-tutorial/lib/install/lib
+#      # Fallback: build dirs when install step didn't run
+#      ${CMAKE_CURRENT_LIST_DIR}/../../xdp-tutorial/lib/xdp-tools/lib/libxdp
+#      ${CMAKE_CURRENT_LIST_DIR}/../../xdp-tutorial/lib/libbpf/src)
+#  if (_xdp_dep_${_xdp_dep}_LIBRARY)
+#    list (APPEND dpdk_dependencies ${_xdp_dep_${_xdp_dep}_LIBRARY})
+#  endif ()
+#endforeach ()
+# libbpf.a requires libelf and libz at link time
+#list (APPEND dpdk_dependencies elf z)
 
 if (dpdk_FOUND AND NOT (TARGET dpdk))
   get_filename_component (library_suffix "${dpdk_EAL_LIBRARY}" LAST_EXT)
